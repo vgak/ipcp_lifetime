@@ -13,6 +13,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <math.h>
+#include <stdarg.h>
 
 #include <gpib/ib.h>
 
@@ -21,7 +23,18 @@
 #define PPS_GPIB_NAME "AKIP-1142/3G"
 
 // === pps
-#define VOLTAGE 10.0
+#define PPS_TIMEOUT_S 1
+
+// === osc
+#define OSC_ACQUIRE_POINTS 64000
+#define OSC_ACQUIRE_BLOCK_SIZE 4000
+#define OSC_ACQUIRE_BLOCKS (OSC_ACQUIRE_POINTS / OSC_ACQUIRE_BLOCK_SIZE)
+#define OSC_YSCALE_V 0.5 // 1, 2, 5 ...
+#define OSC_HOLDOFF_S 1 // 1, 2, 5 ...
+#define OSC_DUTY 50
+
+#define OSC_TIMEOUT_S 2
+#define OSC_ATTEMPTS 5
 
 // === threads
 void *commander(void *);
@@ -38,13 +51,15 @@ void gpib_print_error(int fd);
 
 int usbtmc_write(int dev, const char *cmd);
 int usbtmc_read(int dev, char *buf, int buf_length);
+int usbtmc_print(int dev, const char *format, ...);
+
+double freq_to_scale(int freq);
 
 
 // === global variables
-char dir_str[100];
+char dir_name[100];
 pthread_rwlock_t run_lock;
 int run;
-char filename_vac[100];
 const char *experiment_name;
 
 // === program entry point
@@ -81,7 +96,7 @@ int main(int argc, char const *argv[])
 	run = 1;
 
 	// === create dirictory in "20191012_153504_<experiment_name>" format
-	snprintf(dir_str, 100, "%04d-%02d-%02d_%02d-%02d-%02d_%s",
+	snprintf(dir_name, 100, "%04d-%02d-%02d_%02d-%02d-%02d_%s",
 		start_time_struct.tm_year + 1900,
 		start_time_struct.tm_mon + 1,
 		start_time_struct.tm_mday,
@@ -90,17 +105,13 @@ int main(int argc, char const *argv[])
 		start_time_struct.tm_sec,
 		experiment_name
 	);
-	status = mkdir(dir_str, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+	status = mkdir(dir_name, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
 	if (status == -1)
 	{
 		fprintf(stderr, "# E: unable to create experiment directory (%s)\n", strerror(errno));
 		ret = -2;
 		goto main_exit;
 	}
-
-	// === create file names
-	snprintf(filename_vac, 100, "%s/lifetime.dat", dir_str);
-	// printf("filename_vac \"%s\"\n", filename_vac);
 
 	// === now start threads
 	pthread_create(&t_commander, NULL, commander, NULL);
@@ -113,6 +124,7 @@ int main(int argc, char const *argv[])
 	// === and wait for cancelation finish
 	pthread_cancel(t_commander);
 	pthread_join(t_commander, NULL);
+	printf("\n");
 
 	main_exit:
 	return ret;
@@ -170,19 +182,15 @@ void *worker(void *arg)
 	int osc_fd;
 	int pps_fd;
 
-	int    lt_index;
-	double lt_time;
-	double pps_voltage;
-	double pps_current;
-	int8_t curve[64000];
-	double laser_voltage;
-	double laser_current;
+	char filename_lt[100];
+	char gnuplot_cmd[100];
+	FILE *lt_fp;
+	FILE *gp;
 
-	FILE  *lf_fp;
-	FILE  *gp;
-	char   buf[100];
-	char   buf_curve_head[128];
-	char   buf_curve_body[4029];
+	// frequencies and corresponding scales
+	double freq[10] = {1000, 500, 200, 100, 50, 20, 10, 5, 2, 1};
+	double scale[10];
+	for (int i = 0; i < 10; ++i) scale[i] = freq_to_scale(freq[i]);
 
 	// === first we are connecting to instruments
 	r = open(HANTEK_TMC, O_RDWR);
@@ -201,13 +209,11 @@ void *worker(void *arg)
 	}
 	pps_fd = r;
 
-#define DEBUG
-
 	// === init pps
 	gpib_write(pps_fd, "output 0");
 	gpib_write(pps_fd, "instrument:nselect 1");
 	gpib_write(pps_fd, "voltage:limit 11V");
-	gpib_write(pps_fd, "voltage 0.0");
+	gpib_write(pps_fd, "voltage 10.0");
 	gpib_write(pps_fd, "current 0.1");
 	gpib_write(pps_fd, "channel:output 1");
 	gpib_write(pps_fd, "instrument:nselect 2");
@@ -216,7 +222,8 @@ void *worker(void *arg)
 	gpib_write(pps_fd, "current 0.15");
 	gpib_write(pps_fd, "channel:output 1");
 	gpib_write(pps_fd, "instrument:nselect 1");
-	// gpib_print_error(pps_fd);
+
+	sleep(PPS_TIMEOUT_S);
 
 	// === init osc
 	usbtmc_write(osc_fd, "dds:switch 0");
@@ -224,75 +231,74 @@ void *worker(void *arg)
 	usbtmc_write(osc_fd, "channel2:display off");
 	usbtmc_write(osc_fd, "channel3:display off");
 	usbtmc_write(osc_fd, "channel4:display off");
-
 	usbtmc_write(osc_fd, "channel1:bwlimit on");
 	usbtmc_write(osc_fd, "channel1:coupling dc");
 	usbtmc_write(osc_fd, "channel1:invert off");
+	usbtmc_print(osc_fd, "channel1:scale %fV", OSC_YSCALE_V);
 	usbtmc_write(osc_fd, "channel1:offset 0V");
-	usbtmc_write(osc_fd, "channel1:scale 1V");
 	usbtmc_write(osc_fd, "channel1:probe 1");
 	usbtmc_write(osc_fd, "channel1:vernier off");
 	usbtmc_write(osc_fd, "channel1:display on");
-
 	usbtmc_write(osc_fd, "acquire:type normal");
-	usbtmc_write(osc_fd, "acquire:points 64000"); // = 16 * 4000(points) = 16 * timebase:range(s)
-
+	usbtmc_print(osc_fd, "acquire:points %d", OSC_ACQUIRE_POINTS);
 	usbtmc_write(osc_fd, "timebase:mode main");
 	usbtmc_write(osc_fd, "timebase:vernier off");
-	// usbtmc_write(osc_fd, "timebase:scale 0.0005"); == 1, 2, 5 ...
-	usbtmc_write(osc_fd, "timebase:range 0.008"); // = scale * 16
-
+	usbtmc_print(osc_fd, "timebase:scale %.5lf", scale[0]); // = 1, 2 ,5 ...
 	usbtmc_write(osc_fd, "trigger:mode edge");
-	usbtmc_write(osc_fd, "trigger:sweep normal");
-	usbtmc_write(osc_fd, "trigger:holdoff 1");
+	usbtmc_write(osc_fd, "trigger:sweep auto");
+	usbtmc_print(osc_fd, "trigger:holdoff %d", OSC_HOLDOFF_S);
 	usbtmc_write(osc_fd, "trigger:edge:source ext");
 	usbtmc_write(osc_fd, "trigger:edge:slope rising");
-	usbtmc_write(osc_fd, "trigger:edge:level 1");
-
+	usbtmc_write(osc_fd, "trigger:edge:level 1.75");
 	usbtmc_write(osc_fd, "dds:type square");
-	usbtmc_write(osc_fd, "dds:freq 500");
+	usbtmc_print(osc_fd, "dds:freq %.0lf", freq[0]);
 	usbtmc_write(osc_fd, "dds:amp 3.5");
 	usbtmc_write(osc_fd, "dds:offset 1.75");
-	usbtmc_write(osc_fd, "dds:duty 50");
+	usbtmc_print(osc_fd, "dds:duty %d", OSC_DUTY);
 	usbtmc_write(osc_fd, "dds:wave:mode off");
 	usbtmc_write(osc_fd, "dds:burst:switch off");
 	usbtmc_write(osc_fd, "dds:switch 1");
 
-	// === create vac file
-	lf_fp = fopen(filename_vac, "w+");
-	if(lf_fp == NULL)
+	sleep(OSC_TIMEOUT_S);
+
+	// === create log file
+	snprintf(filename_lt, 100, "%s/lifetime.dat", dir_name);
+
+	lt_fp = fopen(filename_lt, "w+");
+	if(lt_fp == NULL)
 	{
-		fprintf(stderr, "# E: Unable to open file \"%s\" (%s)\n", filename_vac, strerror(ferror(lf_fp)));
+		fprintf(stderr, "# E: Unable to open file \"%s\" (%s)\n", filename_lt, strerror(ferror(lt_fp)));
 		goto worker_vac_fopen;
 	}
-	setlinebuf(lf_fp);
+	setlinebuf(lt_fp);
 
 	// === write vac header
-	r = fprintf(lf_fp,
-		"# mipt_r125_vac_modulation_divider\n"
-		"# Dependence of alternative voltage on voltage using resistive divider\n"
+	r = fprintf(lt_fp,
+		"# mipt_r125_lifetime\n"
+		"# Dependence of decay curve on frequency\n"
 		"# Experiment name \"%s\"\n"
+		"#\n"
 		"# Columns:\n"
 		"# 1 - index\n"
 		"# 2 - time, s\n"
-		"# 3 - pps voltage, V\n"
-		"# 4 - pps current, A\n"
-		"# 5 - vm voltage (ac), V\n"
-		"# 6 - laser voltage, V\n"
-		"# 7 - laser current, A\n"
-		"# 8 - laset modulation rate, Hz\n"
-		"# 9 - laset modulation duty, %%\n",
+		"# 3 - sample voltage, V\n"
+		"# 4 - sample current, A\n"
+		"# 5 - laser voltage, V\n"
+		"# 6 - laser current, A\n"
+		"# 7 - laset modulation rate, Hz\n"
+		"# 8 - laset modulation duty, %%\n"
+		"# 9 - curve sampling rate, Hz\n",
 		experiment_name
 	);
 	if(r < 0)
 	{
-		fprintf(stderr, "# E: Unable to print to file \"%s\" (%s)\n", filename_vac, strerror(r));
-		goto worker_vac_header;
+		fprintf(stderr, "# E: Unable to print to file \"%s\" (%s)\n", filename_lt, strerror(r));
+		goto worker_lt_header;
 	}
 
 	// === open gnuplot
-	snprintf(buf, 100, "gnuplot > %s/gnuplot.log 2>&1", dir_str);
-	gp = popen(buf, "w");
+	snprintf(gnuplot_cmd, 100, "gnuplot > %s/gnuplot.log 2>&1", dir_name);
+	gp = popen(gnuplot_cmd, "w");
 	if (gp == NULL)
 	{
 		fprintf(stderr, "# E: unable to open gnuplot pipe (%s)\n", strerror(errno));
@@ -302,9 +308,8 @@ void *worker(void *arg)
 
 	// === prepare gnuplot
 	r = fprintf(gp,
-		"set xrange [0:10]\n"
-		"set xlabel \"Voltage, V\"\n"
-		"set ylabel \"Voltage (AC), V\"\n"
+		"set xlabel \"Time, s\"\n"
+		"set ylabel \"Voltage, V\"\n"
 	);
 	if(r < 0)
 	{
@@ -313,83 +318,164 @@ void *worker(void *arg)
 	}
 
 	// === let the action begins!
-	lt_index = 0;
-
-	while(get_run())
+	for (int lt_index = 0; lt_index < 10; ++lt_index)
 	{
-		voltage = lt_index * VOLTAGE_STEP;
-		if (voltage > VOLTAGE_MAX)
+		double lt_time;
+		double sample_voltage;
+		double sample_current;
+		double laser_voltage;
+		double laser_current;
+		double sampling_rate;
+		char   buf[100];
+
+		if (get_run())
 		{
-			set_run(0);
+			usbtmc_print(osc_fd, "dds:freq %.0lf", freq[lt_index]);
+			usbtmc_print(osc_fd, "timebase:scale %.5lf", scale[lt_index]);
+			sleep(OSC_TIMEOUT_S);
+
+			lt_time = get_time();
+			if (lt_time < 0)
+			{
+				fprintf(stderr, "# E: Unable to get time\n");
+				set_run(0);
+				break;
+			}
+
+			gpib_write(pps_fd, "measure:voltage:all?");
+			gpib_read(pps_fd, buf, 100);
+			sscanf(buf, "%lf, %lf", &sample_voltage, &laser_voltage);
+
+			gpib_write(pps_fd, "measure:current:all?");
+			gpib_read(pps_fd, buf, 100);
+			sscanf(buf, "%lf, %lf", &sample_current, &laser_current);
+
+			for (int attempt = 0; attempt < OSC_ATTEMPTS; ++attempt)
+			{
+				FILE *curve_fp;
+				char *b;
+				char filename_curve[100];
+				char buf_curve_head[128];
+				char buf_curve_body[4029];
+				char srbuf[10] = {0};
+
+				if (get_run())
+				{
+					// === crate curve file
+					snprintf(filename_curve, 100, "%s/curve_%d.%d.dat", dir_name, lt_index, attempt);
+					curve_fp = fopen(filename_curve, "w+");
+					if(curve_fp == NULL)
+					{
+						fprintf(stderr, "# E: Unable to open file \"%s\" (%s)\n", filename_curve, strerror(ferror(curve_fp)));
+						set_run(0);
+						continue;
+					}
+					setlinebuf(curve_fp);
+
+					// === write curve header
+					r = fprintf(curve_fp,
+						"# mipt_r125_lifetime\n"
+						"# Dependence of decay curve on frequency\n"
+						"# Experiment name \"%s\"\n"
+						"# Columns:\n"
+						"# 1 - index, points\n"
+						"# 2 - value, int8_t\n",
+						experiment_name
+					);
+
+					usbtmc_write(osc_fd, "trigger:sweep single");
+					usbtmc_write(osc_fd, "trigger:force");
+					usleep((16 * OSC_ACQUIRE_BLOCKS * scale[lt_index] + OSC_HOLDOFF_S) * 1e6);
+
+					usbtmc_write(osc_fd, "waveform:data:all?");
+					usbtmc_read(osc_fd, buf_curve_head, 128);
+
+					b = buf_curve_head;
+					fprintf(curve_fp, "# packet head = %.2s\n", b); b += 2;
+					fprintf(curve_fp, "# Represents the byte length of the current packet = %.9s\n", b); b += 9;
+					fprintf(curve_fp, "# The total length of bytes representing the amount of data = %.9s\n", b); b += 9;
+					fprintf(curve_fp, "# Represents the byte length of the data that has been uploaded = %.9s\n", b); b += 9;
+					fprintf(curve_fp, "# Represents the current running state = %.1s\n", b); b += 1;
+					fprintf(curve_fp, "# Represents the state of the trigger = %.1s\n", b); b += 1;
+					fprintf(curve_fp, "# bias of ch1 = %.4s\n", b); b += 4;
+					fprintf(curve_fp, "# bias of ch2 = %.4s\n", b); b += 4;
+					fprintf(curve_fp, "# bias of ch3 = %.4s\n", b); b += 4;
+					fprintf(curve_fp, "# bias of ch4 = %.4s\n", b); b += 4;
+					fprintf(curve_fp, "# volt of ch1 = %.8s\n", b); b += 8;
+					fprintf(curve_fp, "# volt of ch2 = %.8s\n", b); b += 8;
+					fprintf(curve_fp, "# volt of ch3 = %.8s\n", b); b += 8;
+					fprintf(curve_fp, "# volt of ch4 = %.8s\n", b); b += 8;
+					fprintf(curve_fp, "# Represents the enabling of the channel [1-4] = %.4s\n", b); b += 4;
+					memcpy(srbuf, b, 9);
+					sampling_rate = atof(srbuf);
+					fprintf(curve_fp, "# Indicated sampling rate = %.9s\n", b); b += 9;
+					fprintf(curve_fp, "# Sampling multiple = %.6s\n", b); b += 6;
+					fprintf(curve_fp, "# The current frame displays trigger time = %.9s\n", b); b += 9;
+					fprintf(curve_fp, "# The current frame shows the starting point of the data start point = %.9s\n", b); b += 9;
+					fprintf(curve_fp, "# Reserved bit = %.12s\n", b); b += 12;
+
+					for (int block = 0; block < OSC_ACQUIRE_BLOCKS; ++block)
+					{
+						usbtmc_write(osc_fd, "waveform:data:all?");
+						usbtmc_read(osc_fd, buf_curve_body, 4029);
+
+						b = buf_curve_body;
+						fprintf(curve_fp, "# packet head = %.2s\n", b); b += 2;
+						fprintf(curve_fp, "# Represents the byte length of the current packet = %.9s\n", b); b += 9;
+						fprintf(curve_fp, "# The total length of bytes representing the amount of data = %.9s\n", b); b += 9;
+						fprintf(curve_fp, "# Represents the byte length of the data that has been uploaded = %.9s\n", b); b += 9;
+						for (int block_point = 0; block_point < OSC_ACQUIRE_BLOCK_SIZE; ++block_point)
+						{
+							fprintf(curve_fp, "%d\t%d\n", block * OSC_ACQUIRE_BLOCK_SIZE + block_point, b[block_point]);
+						}
+					}
+
+					r = fprintf(gp,
+						"set title \"i = %d.%d, t = %.3lf s, U = %.3lf V, I = %.3lf A, Ul = %.3lf V, Il = %.3lf A\"\n"
+						"plot \"%s\" u ($1/%le):($2*%le) w l lw 1 title \"freq = %.1lf Hz, duty = %d %%\"\n",
+						lt_index, attempt, lt_time, sample_voltage, sample_current, laser_voltage, laser_current,
+						filename_curve, sampling_rate, 10*OSC_YSCALE_V/256.0, freq[lt_index], OSC_DUTY
+					);
+					if(r < 0)
+					{
+						fprintf(stderr, "# E: Unable to print to gp (%s)\n", strerror(r));
+						set_run(0);
+					}
+
+					r = fclose(curve_fp);
+					if (r == EOF)
+					{
+						fprintf(stderr, "# E: Unable to close file \"%s\" (%s)\n", filename_curve, strerror(errno));
+					}
+				}
+				else
+				{
+					break;
+				}
+			}
+
+			r = fprintf(lt_fp, "%d\t%le\t%.3le\t%.3le\t%.3le\t%.3le\t%.0lf\t%d\t%le\n",
+				lt_index,
+				lt_time,
+				sample_voltage,
+				sample_current,
+				laser_voltage,
+				laser_current,
+				freq[lt_index],
+				OSC_DUTY,
+				sampling_rate
+			);
+			if(r < 0)
+			{
+				fprintf(stderr, "# E: Unable to print to file \"%s\" (%s)\n", filename_lt, strerror(r));
+				set_run(0);
+				break;
+			}
+		}
+		else
+		{
 			break;
 		}
-
-		snprintf(buf, 100, "voltage %.3lf", voltage);
-		gpib_write(pps_fd, buf);
-
-		usleep(STEP_DELAY);
-
-		lt_time = get_time();
-		if (lt_time < 0)
-		{
-			fprintf(stderr, "# E: Unable to get time\n");
-			set_run(0);
-			break;
-		}
-
-		gpib_write(pps_fd, "measure:voltage:all?");
-		gpib_read(pps_fd, buf, 100);
-		sscanf(buf, "%lf, %lf", &pps_voltage, &laser_voltage);
-		// pps_voltage = atof(buf);
-
-		gpib_write(pps_fd, "measure:current:all?");
-		gpib_read(pps_fd, buf, 100);
-		sscanf(buf, "%lf, %lf", &pps_current, &laser_current);
-		// pps_current = atof(buf);
-
-		gpib_write(vm_fd, "read?");
-		gpib_read(vm_fd, buf, 100);
-		vm_voltage = atof(buf);
-
-		r = fprintf(lf_fp, "%d\t%le\t%.3le\t%.3le\t%.8le\t%.3le\t%.3le\t%.1lf\t%d\n",
-			lt_index,
-			lt_time,
-			pps_voltage,
-			pps_current,
-			vm_voltage,
-			laser_voltage,
-			laser_current,
-			500.0,
-			50
-		);
-		if(r < 0)
-		{
-			fprintf(stderr, "# E: Unable to print to file \"%s\" (%s)\n", filename_vac, strerror(r));
-			set_run(0);
-			break;
-		}
-
-		r = fprintf(gp,
-			"set title \"i = %d, t = %.3lf s, Ul = %.3lf V, Il = %.3lf A, freq = %.1lf Hz, duty = %d %%\"\n"
-			"plot \"%s\" u 3:5 w l lw 1 title \"U = %.3lf V, Vac = %.3le V\"\n",
-			lt_index,
-			lt_time,
-			laser_voltage,
-			laser_current,
-			500.0,
-			50,
-			filename_vac,
-			pps_voltage,
-			vm_voltage
-		);
-		if(r < 0)
-		{
-			fprintf(stderr, "# E: Unable to print to gp (%s)\n", strerror(r));
-			set_run(0);
-			break;
-		}
-
-		lt_index++;
 	}
 
 	gpib_write(pps_fd, "output 0");
@@ -410,24 +496,18 @@ void *worker(void *arg)
 	worker_gp_popen:
 
 
-	worker_vac_header:
+	worker_lt_header:
 
-	r = fclose(lf_fp);
+	r = fclose(lt_fp);
 	if (r == EOF)
 	{
-		fprintf(stderr, "# E: Unable to close file \"%s\" (%s)\n", filename_vac, strerror(errno));
+		fprintf(stderr, "# E: Unable to close file \"%s\" (%s)\n", filename_lt, strerror(errno));
 	}
 	worker_vac_fopen:
 
-	ibclr(vm_fd);
-	gpib_write(vm_fd, "*rst");
-	sleep(1);
-	ibloc(vm_fd);
-	worker_vm_ibfind:
-
 	ibclr(pps_fd);
 	gpib_write(pps_fd, "*rst");
-	sleep(1);
+	sleep(PPS_TIMEOUT_S);
 	ibloc(pps_fd);
 	worker_pps_ibfind:
 
@@ -519,12 +599,10 @@ int gpib_read(int fd, char *buf, long len)
 
 void gpib_print_error(int fd)
 {
-#ifdef DEBUG
 	char buf[100] = {0};
 	gpib_write(fd, "system:error?");
 	gpib_read(fd, buf, 100);
 	fprintf(stderr, "[debug] error = %s\n", buf);
-#endif
 }
 
 int usbtmc_write(int dev, const char *cmd)
@@ -551,4 +629,43 @@ int usbtmc_read(int dev, char *buf, int buf_length)
 	}
 
 	return r;
+}
+
+int usbtmc_print(int dev, const char *format, ...)
+{
+	int r;
+    va_list args;
+
+    va_start(args, format);
+
+    r = vdprintf(dev, format, args);
+    if (r < 0)
+	{
+		fprintf(stderr, "# E: unable to printf to hantek (%s)\n", strerror(errno));
+	}
+
+    va_end(args);
+
+    return r;
+}
+
+double freq_to_scale(int freq)
+{
+	// 2 * period < 16 * 16 * scale, scale = 1, 2, 5 ...
+	double l, f, m, e;
+
+	l = log10(2.0 * (1.0 / freq) / (16.0 * OSC_ACQUIRE_BLOCKS));
+	f = fmod(l, 1.0);
+	m = pow(10.0, f);
+	e = pow(10.0, l - f);
+
+	if      (m <= 0.1) m = 0.1;
+	else if (m <= 0.2) m = 0.2;
+	else if (m <= 0.5) m = 0.5;
+	else if (m <= 1.0) m = 1.0;
+	else if (m <= 2.0) m = 2.0;
+	else if (m <= 5.0) m = 5.0;
+	else               m = 10.0;
+
+	return m * e;
 }
